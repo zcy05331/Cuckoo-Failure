@@ -1,13 +1,16 @@
 # Cuckoo-Failure
 
-C++ implementation of the dynamic-programming algorithms of *Precise Failure
-Probabilities for d-Choice Cuckoo Hashing*: the exact probability
+C++ implementation of the algorithms of *Exact Failure Probabilities for
+d-Choice Cuckoo Hashing*: dynamic programs for the exact probability
 `p_fail = N_bad / Q^n` that `n` items with `d` candidate slots each admit no
-placement into `M` slots.
+valid placement into `M` slots. This is the implementation referenced by the
+paper, including the accelerated `O(n^2 log n)` and `O(n^{d+2})` versions.
 
-Models: one table with a uniform `d`-subset per item (`Q = C(M, d)`), one table
-with `d` draws with replacement (`Q = M^d`), and `d` separate tables of lengths
-`m_1, ..., m_d` with one uniform slot per table (`Q = m_1 ... m_d`).
+Models: one table with a uniform `d`-subset of candidate slots per item
+(`Q = C(M, d)`, Section 3), `d` separate tables of lengths `m_1, ..., m_d`
+with one uniform slot per table (`Q = m_1 ... m_d`, Section 4), and the
+variant of Section 3.4 with `d` independent draws with replacement
+(`Q = M^d`).
 
 ## Algorithms
 
@@ -24,7 +27,8 @@ costs `O(n^2)` and `nbad(n, m)` costs `O(n^{d+1})` per query. In the
 `O(n^{d+2})` algorithm the shared inner sums form a `d`-dimensional convolution
 whose kernel has the generating function `-log(1 - sigma)`,
 `sigma = x_1 + ... + x_d`, evaluated by Horner's rule with `O(n)`
-multiplications by `sigma`. The formulas are derived in the header comments.
+multiplications by `sigma`. The formulas are derived in the header comments,
+with the paper's equation numbers.
 
 All arithmetic is modulo 32-bit primes. The command-line tool runs the
 algorithm modulo enough NTT-friendly primes, reconstructs `N_bad` exactly by
