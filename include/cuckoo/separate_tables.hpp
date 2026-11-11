@@ -47,7 +47,7 @@ inline Mint separate_forward(int n, const std::vector<int>& m) {
     };
     std::vector<State> st;
     {
-        State s0{0, std::vector<int>(d, 0), 0, Mint::raw(1)};
+        State s0{0, std::vector<int>(d, 0), 0, Mint::one()};
         for (int x : m) s0.h *= Mint(x);
         st.push_back(s0);
     }
@@ -57,7 +57,7 @@ inline Mint separate_forward(int n, const std::vector<int>& m) {
         const int p = M - l;
         std::function<void(int, int)> gen = [&](int t, int remaining) {
             if (t == d) {
-                State s{l, std::vector<int>(d), 0, Mint::raw(1)};
+                State s{l, std::vector<int>(d), 0, Mint::one()};
                 for (int j = 0; j < d; ++j) {
                     s.b[j] = m[j] - v[j];
                     s.bsum += s.b[j];
@@ -78,13 +78,13 @@ inline Mint separate_forward(int n, const std::vector<int>& m) {
     const size_t N = st.size();
     std::vector<std::vector<Mint>> hp(N, std::vector<Mint>(n + 1));  // hp[i][u] = h_i^u
     for (size_t i = 0; i < N; ++i) {
-        hp[i][0] = Mint::raw(1);
+        hp[i][0] = Mint::one();
         for (int u = 1; u <= n; ++u) hp[i][u] = hp[i][u - 1] * st[i].h;
     }
     auto nu = [z](int l) { return std::max(0, l - z); };
 
     std::vector<Mint> F(N);
-    F[0] = Mint::raw(1);
+    F[0] = Mint::one();
     for (size_t i = 1; i < N; ++i) {
         const State& T = st[i];
         const int r = T.l;
@@ -196,10 +196,10 @@ struct SeparateSuffix {
         int M = 0;
         for (int x : m) M += x;
         Factorials fac(M);
-        Mint Q = Mint::raw(1);
+        Mint Q = Mint::one();
         for (int x : m) Q *= Mint(x);
         std::vector<Mint> Qpow(n + 1);
-        Qpow[0] = Mint::raw(1);
+        Qpow[0] = Mint::one();
         for (int i = 1; i <= n; ++i) Qpow[i] = Qpow[i - 1] * Q;
         Mint total;
         for (int q = 1; q <= n; ++q) {
@@ -231,8 +231,8 @@ inline SeparateSuffix build_separate_suffix(int nmax, int d) {
     std::vector<Mint> g(N), vfact(N), vfact_inv(N);
     for (int i = 0; i < N; ++i) {
         const int* v = sx.vec(i);
-        g[i] = Mint::raw(1);
-        vfact[i] = Mint::raw(1);
+        g[i] = Mint::one();
+        vfact[i] = Mint::one();
         for (int t = 0; t < d; ++t) {
             g[i] *= Mint(v[t]);
             vfact[i] *= fac.fact[v[t]];

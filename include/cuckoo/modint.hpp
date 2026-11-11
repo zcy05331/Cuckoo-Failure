@@ -1,4 +1,4 @@
-// Modular arithmetic with a runtime prime modulus (< 2^32), factorial tables
+// Modular arithmetic with a runtime prime modulus (odd, < 2^32) in Montgomery form, factorial tables
 // with the paper's binomial convention, and NTT-friendly prime generation.
 #pragma once
 
@@ -9,42 +9,85 @@
 
 namespace cuckoo {
 
+// Arithmetic is done in Montgomery form (R = 2^32): a residue x is stored as
+// x R mod p, so a product needs two 32x32 multiplications and no division.
+// set_mod() must be called before any arithmetic with a new (odd) modulus.
 struct Mint {
-    static inline uint32_t mod = 998244353u;  // set before any arithmetic
-    uint32_t v = 0;
+    static constexpr uint32_t inv32(uint32_t p) {  // p^{-1} mod 2^32, p odd (Newton)
+        uint32_t x = p;
+        for (int i = 0; i < 5; ++i) x *= 2u - p * x;
+        return x;
+    }
+    static constexpr uint32_t r1_of(uint32_t p) { return static_cast<uint32_t>((uint64_t{1} << 32) % p); }
+    static constexpr uint32_t r2_of(uint32_t p) {
+        return static_cast<uint32_t>(static_cast<uint64_t>(r1_of(p)) * r1_of(p) % p);
+    }
+    static inline uint32_t mod_ = 998244353u;
+    static inline uint32_t pinv_ = inv32(998244353u);  // mod^{-1} mod 2^32
+    static inline uint32_t r2_ = r2_of(998244353u);    // 2^64 mod mod
+    static inline uint32_t one_ = r1_of(998244353u);   // 2^32 mod mod, the stored form of 1
+
+    static uint32_t modulus() { return mod_; }
+    static void set_mod(uint32_t p) {
+        if (p < 3 || (p & 1u) == 0) throw std::invalid_argument("Mint: modulus must be odd and >= 3");
+        mod_ = p;
+        pinv_ = inv32(p);
+        r2_ = r2_of(p);
+        one_ = r1_of(p);
+    }
+    // t R^{-1} mod p for t < p 2^32
+    static uint32_t redc(uint64_t t) {
+        const uint32_t m = static_cast<uint32_t>(t) * pinv_;
+        const uint32_t hi = static_cast<uint32_t>(t >> 32);
+        const uint32_t mp = static_cast<uint32_t>((static_cast<uint64_t>(m) * mod_) >> 32);
+        return hi >= mp ? hi - mp : hi - mp + mod_;
+    }
+
+    uint32_t v = 0;  // Montgomery form; use val() for the residue
 
     Mint() = default;
     Mint(long long x) {
-        long long r = x % static_cast<long long>(mod);
-        if (r < 0) r += mod;
-        v = static_cast<uint32_t>(r);
+        long long r = x % static_cast<long long>(mod_);
+        if (r < 0) r += mod_;
+        v = redc(static_cast<uint64_t>(r) * r2_);
     }
+    // From a residue already reduced to [0, mod).
     static Mint raw(uint32_t x) {
         Mint m;
-        m.v = x;
+        m.v = redc(static_cast<uint64_t>(x) * r2_);
         return m;
     }
+    static Mint one() {
+        Mint m;
+        m.v = one_;
+        return m;
+    }
+    uint32_t val() const { return redc(v); }
 
     Mint& operator+=(Mint o) {
         uint64_t s = static_cast<uint64_t>(v) + o.v;
-        if (s >= mod) s -= mod;
+        if (s >= mod_) s -= mod_;
         v = static_cast<uint32_t>(s);
         return *this;
     }
     Mint& operator-=(Mint o) {
-        v = (v >= o.v) ? v - o.v : static_cast<uint32_t>(static_cast<uint64_t>(v) + mod - o.v);
+        v = (v >= o.v) ? v - o.v : static_cast<uint32_t>(static_cast<uint64_t>(v) + mod_ - o.v);
         return *this;
     }
     Mint& operator*=(Mint o) {
-        v = static_cast<uint32_t>(static_cast<uint64_t>(v) * o.v % mod);
+        v = redc(static_cast<uint64_t>(v) * o.v);
         return *this;
     }
     friend Mint operator+(Mint a, Mint b) { return a += b; }
     friend Mint operator-(Mint a, Mint b) { return a -= b; }
     friend Mint operator*(Mint a, Mint b) { return a *= b; }
-    Mint operator-() const { return raw(v ? mod - v : 0); }
+    Mint operator-() const {
+        Mint m;
+        m.v = v ? mod_ - v : 0;
+        return m;
+    }
     Mint pow(unsigned long long e) const {
-        Mint r = raw(1), b = *this;
+        Mint r = one(), b = *this;
         while (e) {
             if (e & 1) r *= b;
             b *= b;
@@ -52,7 +95,7 @@ struct Mint {
         }
         return r;
     }
-    Mint inv() const { return pow(mod - 2); }
+    Mint inv() const { return pow(mod_ - 2); }
     friend Mint operator/(Mint a, Mint b) { return a * b.inv(); }
     bool operator==(Mint o) const { return v == o.v; }
     bool operator!=(Mint o) const { return v != o.v; }
@@ -65,9 +108,9 @@ struct Factorials {
     std::vector<Mint> fact, inv_fact;
 
     explicit Factorials(int n) : fact(n + 1), inv_fact(n + 1) {
-        if (n < 0 || static_cast<uint64_t>(n) >= Mint::mod)
+        if (n < 0 || static_cast<uint64_t>(n) >= Mint::modulus())
             throw std::invalid_argument("factorial table: modulus too small");
-        fact[0] = Mint::raw(1);
+        fact[0] = Mint::one();
         for (int i = 1; i <= n; ++i) fact[i] = fact[i - 1] * Mint(i);
         inv_fact[n] = fact[n].inv();
         for (int i = n; i > 0; --i) inv_fact[i - 1] = inv_fact[i] * Mint(i);

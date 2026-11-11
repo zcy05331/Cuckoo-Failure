@@ -156,7 +156,7 @@ int main(int argc, char** argv) {
     if (o.mod) {
         primes.push_back(static_cast<uint32_t>(o.mod));
     } else {
-        const size_t L = Ntt::next_pow2(2 * static_cast<size_t>(o.n) + 2);
+        const size_t L = one_table_ntt_length(o.n);
         int min_pow2 = 0;
         while ((static_cast<size_t>(1) << min_pow2) < L) ++min_pow2;
         int count = static_cast<int>(bits / 31) + 2;
@@ -172,8 +172,8 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<uint32_t> residues;
     for (uint32_t P : primes) {
-        Mint::mod = P;
-        residues.push_back(run(o).v);
+        Mint::set_mod(P);
+        residues.push_back(run(o).val());
     }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
