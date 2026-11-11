@@ -50,7 +50,7 @@ inline Mint one_table_forward(int n, int M, OneTableModel model) {
     std::vector<std::vector<Mint>> hpow(M + 1, std::vector<Mint>(n + 1));
     for (int b = 0; b <= M; ++b) {
         const Mint h = model.g(M - b, fac);
-        hpow[b][0] = Mint::raw(1);
+        hpow[b][0] = Mint::one();
         for (int u = 1; u <= n; ++u) hpow[b][u] = hpow[b][u - 1] * h;
     }
     auto nu = [z](int l) { return std::max(0, l - z); };
@@ -60,7 +60,7 @@ inline Mint one_table_forward(int n, int M, OneTableModel model) {
     };
 
     std::vector<std::vector<Mint>> F(M, std::vector<Mint>(M + 1));
-    F[0][0] = Mint::raw(1);
+    F[0][0] = Mint::one();
     for (int r = z; r < M; ++r) {
         for (int c = r + 1; c <= M; ++c) {
             Mint s = F[0][0] * tau(0, 0, r, c);
@@ -106,7 +106,7 @@ struct OneTableSuffix {
         Factorials fac(M);
         const Mint Q = model.g(M, fac);
         std::vector<Mint> Qpow(n + 1);
-        Qpow[0] = Mint::raw(1);
+        Qpow[0] = Mint::one();
         for (int i = 1; i <= n; ++i) Qpow[i] = Qpow[i - 1] * Q;
         Mint total;
         for (int q = 1; q <= n; ++q) {
@@ -138,7 +138,7 @@ inline OneTableSuffix build_one_table_suffix_cubic(int nmax, OneTableModel model
     std::vector<std::vector<Mint>> gpow(nmax + 1, std::vector<Mint>(nmax + 1));
     for (int v = 0; v <= nmax; ++v) {
         const Mint g = model.g(v, fac);
-        gpow[v][0] = Mint::raw(1);
+        gpow[v][0] = Mint::one();
         for (int e = 1; e <= nmax; ++e) gpow[v][e] = gpow[v][e - 1] * g;
     }
     std::vector<std::vector<Mint>> S(nmax);  // S[v][q], 1 <= q <= v
@@ -165,12 +165,20 @@ inline OneTableSuffix build_one_table_suffix_cubic(int nmax, OneTableModel model
     return T;
 }
 
+// Transform length for build_one_table_suffix_ntt. The convolutions are cyclic and only the
+// "middle" entries are read: stage 1 convolves a[0..v-1] with ker[1..nmax] and reads c[v..nmax-1],
+// stage 2 convolves b[1..v] with ker and reads c[v+1..nmax]. A product index i >= L wraps to
+// i - L <= v + nmax - L, which is below every entry read as soon as L >= nmax + 1 (it is then
+// < v in stage 1 and <= v in stage 2). So L = next_pow2(nmax + 1) is enough: 2 nmax when nmax is
+// a power of two, instead of the 4 nmax a full product of both operands would need.
+inline size_t one_table_ntt_length(int nmax) { return Ntt::next_pow2(static_cast<size_t>(nmax) + 1); }
+
 // O(n^2 log n) construction of the suffix table with NTT convolutions.
 inline OneTableSuffix build_one_table_suffix_ntt(int nmax, OneTableModel model) {
     OneTableSuffix T = detail::init_one_table_suffix(nmax, model);
     Factorials fac(nmax);
     Ntt ntt;
-    const size_t L = Ntt::next_pow2(2 * static_cast<size_t>(nmax) + 2);
+    const size_t L = one_table_ntt_length(nmax);
     std::vector<Mint> ker(nmax + 1);  // ker[t] = 1/t
     for (int t = 1; t <= nmax; ++t) ker[t] = Mint(t).inv();
     const Ntt::Kernel K = ntt.prepare(ker, L);
@@ -200,7 +208,7 @@ inline OneTableSuffix build_one_table_suffix_ntt(int nmax, OneTableModel model) 
         if (gval[v].is_zero()) continue;  // V[p][v] = 0 when no candidate set fits in v slots
         std::vector<Mint> b(v + 1);
         bool any = false;
-        Mint gi = Mint::raw(1);
+        Mint gi = Mint::one();
         for (int q = 1; q <= v; ++q) {
             gi *= ginv[v];
             b[q] = S[v][q] * gi * fac.inv_fact[q] * fac.inv_fact[v - q];

@@ -32,7 +32,7 @@ std::string vec_str(const std::vector<int>& m) {
 
 std::string mod_str(uint32_t P, const std::vector<std::pair<const char*, Mint>>& vals) {
     std::string s = " [mod " + std::to_string(P) + ":";
-    for (const auto& kv : vals) s += std::string(" ") + kv.first + "=" + std::to_string(kv.second.v);
+    for (const auto& kv : vals) s += std::string(" ") + kv.first + "=" + std::to_string(kv.second.val());
     return s + "]";
 }
 
@@ -42,7 +42,7 @@ void one_table_vs_brute(int n, int M, int d, bool rep) {
     bool ok = true;
     std::string detail;
     for (uint32_t P : kPrimes) {
-        Mint::mod = P;
+        Mint::set_mod(P);
         const Mint expect = Mint(static_cast<long long>(br.nbad % P));
         const OneTableModel model{d, rep};
         const Mint a = one_table_forward(n, M, model);
@@ -67,7 +67,7 @@ void separate_vs_brute(int n, const std::vector<int>& m) {
     bool ok = true;
     std::string detail;
     for (uint32_t P : kPrimes) {
-        Mint::mod = P;
+        Mint::set_mod(P);
         const Mint expect = Mint(static_cast<long long>(br.nbad % P));
         const Mint a = separate_forward(n, m);
         const Mint b = build_separate_suffix(n, static_cast<int>(m.size())).nbad(n, m);
@@ -86,7 +86,7 @@ void one_table_cross(int n, int M, int d, bool rep) {
     bool ok = true;
     std::string detail;
     for (uint32_t P : kPrimes) {
-        Mint::mod = P;
+        Mint::set_mod(P);
         const OneTableModel model{d, rep};
         const Mint a = one_table_forward(n, M, model);
         const Mint b = build_one_table_suffix_cubic(n, model).nbad(n, M);
@@ -106,7 +106,7 @@ void separate_cross(int n, const std::vector<int>& m) {
     bool ok = true;
     std::string detail;
     for (uint32_t P : kPrimes) {
-        Mint::mod = P;
+        Mint::set_mod(P);
         const Mint a = separate_forward(n, m);
         const Mint b = build_separate_suffix(n, static_cast<int>(m.size())).nbad(n, m);
         if (a != b) {
@@ -126,7 +126,7 @@ void birthday(int n, int M) {
     bool ok = true;
     std::string detail;
     for (uint32_t P : kPrimes) {
-        Mint::mod = P;
+        Mint::set_mod(P);
         Factorials fac(M);
         const Mint expect = Mint(M).pow(n) - fac.fact[M] * fac.inv_fact[M - n];
         const Mint a = one_table_forward(n, M, {1, false});
@@ -147,7 +147,7 @@ void birthday(int n, int M) {
 
 // One suffix table serves every (n, M) with n <= nmax, and every (n, m).
 void reuse_tables() {
-    Mint::mod = kPrimes[0];
+    Mint::set_mod(kPrimes[0]);
     bool ok = true;
     const OneTableSuffix T = build_one_table_suffix_ntt(24, {3, false});
     for (int n : {5, 12, 24})
@@ -167,8 +167,8 @@ void crt_exact() {
     const std::vector<uint32_t> primes = ntt_primes(3, 10);
     std::vector<uint32_t> res;
     for (uint32_t P : primes) {
-        Mint::mod = P;
-        res.push_back(build_one_table_suffix_ntt(n, {d, false}).nbad(n, M).v);
+        Mint::set_mod(P);
+        res.push_back(build_one_table_suffix_ntt(n, {d, false}).nbad(n, M).val());
     }
     const std::vector<uint32_t> x = garner(primes, res);
     const std::string s = mixed_radix_to_bignat(primes, x).str();

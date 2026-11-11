@@ -42,6 +42,14 @@ make check    # 83 checks: brute force on 65 small instances modulo two primes,
               # cross-checks between the algorithms, the d = 1 closed form, CRT reconstruction
 ```
 
+## Large n: `fast/`
+
+`fast/cuckoo_fast.cu` is a batch version of the O(n^2 log n) one-table algorithm with 64-bit
+residues and 50-bit primes. The same source builds as plain host code (`make fast`), with the
+hot loops in AVX-512 IFMA (`make fast-ifma`) and for CUDA (`make fast-gpu`); all builds print
+the same residues, which `fast/post_gmp.py` combines into N_bad and p_fail. Runs can be split
+over nodes or GPUs by prime range and resumed. See `fast/README.md`.
+
 ## Usage
 
 ```

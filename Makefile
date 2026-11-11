@@ -22,3 +22,15 @@ clean:
 	rm -rf bin
 
 .PHONY: all check clean
+
+# ---- fast/: 64-bit batch engine (same source for CUDA, plain host and AVX-512 IFMA host) ----
+FASTFLAGS ?= -O3 -std=c++17 -Wall -Wextra
+fast: bin/cuckoo_fast_cpu$(EXE)
+bin/cuckoo_fast_cpu$(EXE): fast/cuckoo_fast.cu fast/ifma.inc | bin
+	$(CXX) $(FASTFLAGS) -x c++ fast/cuckoo_fast.cu -o $@
+fast-ifma: bin/cuckoo_fast_ifma$(EXE)
+bin/cuckoo_fast_ifma$(EXE): fast/cuckoo_fast.cu fast/ifma.inc | bin
+	$(CXX) $(FASTFLAGS) -mavx2 -mavx512f -mavx512dq -mavx512vl -mavx512ifma -x c++ fast/cuckoo_fast.cu -o $@
+fast-gpu: bin/cuckoo_fast_gpu$(EXE)
+bin/cuckoo_fast_gpu$(EXE): fast/cuckoo_fast.cu | bin
+	nvcc -O3 -std=c++17 fast/cuckoo_fast.cu -o $@
