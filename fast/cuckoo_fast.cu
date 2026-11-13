@@ -59,6 +59,7 @@
 #error "the IFMA build needs FP_RB = 52"
 #endif
 #define TWO_ADIC 20  // every prime has 2^20 | p - 1: transforms up to length 2^20
+#define TILE 8       // columns of S and V buffered before they are written into the rows
 
 typedef uint64_t u64;
 
@@ -123,15 +124,25 @@ struct Ctx {
     u64 *V, *S;              // [B][T], [B][TS]
     u64 *glo, *ghi;          // [B][LO], [B][HI]   g^j and g^(i LO)
     u64 *gilo, *gihi;        // same for 1/g
-    u64 *A, *qout;           // [B][NA]  query scratch
-    size_t F1, L, T, TS, LO, HI, NA;
+    u64* inv;                // [B][F1]  1/t
+    u64 *qM, *qN;            // [J]      M and n of the active queries
+    u64* qo;                 // [B][J][NA]
+    size_t F1, L, T, TS, LO, HI, NA, J;
     int nmax, h, d;
     int lg;  // log2 L: flat indices are (b << lg) | i, so kernels split them with shifts
+    // Tile buffers: step v writes column v of S and of V, but S and V are read by rows. The
+    // columns v0 .. v0 + TILE - 1 are kept column-major in SS and VS (entry of row r and column
+    // v0 + t at t NS + r, NS = nmax + 1) and moved into the rows by FlushTile, so the writes into
+    // S and V fill whole cache lines instead of one word per line.
+    u64 *SS, *VS;  // [B][TILE][NS]
+    size_t NS;
+    int v0;
 };
 DEV size_t offV(size_t p) { return p * (p - 1) / 2; }  // row p >= 1, entries w = 0..p-1
 DEV size_t offS(size_t v) { return v * (v - 1) / 2; }  // row v >= 1, entry q stored at q - 1
 
-// Stage 1 input: a[w] = V[v][w] / (w! (v-w-1)!), w < v.
+DEV u64* tile(u64* base, const Ctx& c, size_t b, size_t col) { return base + (b * TILE + (col - (size_t)c.v0)) * c.NS; }
+// Stage 1 input: a[w] = V[v][w] / (w! (v-w-1)!), w < v (columns w >= v0 are still in the tile).
 struct Stage1Pre {
     Ctx c;
     int v;
@@ -141,7 +152,8 @@ struct Stage1Pre {
         if (i < (size_t)v) {
             const Mod m = c.mod[b];
             const u64* fi = c.ifact + b * c.F1;
-            r = mmul(mmul(c.V[b * c.T + offV(v) + i], fi[i], m), fi[v - 1 - i], m);
+            const u64 x = i < (size_t)c.v0 ? c.V[b * c.T + offV(v) + i] : tile(c.VS, c, b, i)[v];
+            r = mmul(mmul(x, fi[i], m), fi[v - 1 - i], m);
         }
         c.buf[b * c.L + i] = r;
     }
@@ -155,7 +167,7 @@ struct Stage1Post {
         if (i >= (size_t)(c.nmax - v)) return;
         const Mod m = c.mod[b];
         const u64 *f = c.fact + b * c.F1, *fi = c.ifact + b * c.F1;
-        c.S[b * c.TS + offS(vp) + v - 1] = mmul(mmul(f[vp], fi[vp - v], m), c.buf[b * c.L + vp], m);
+        tile(c.SS, c, b, v)[vp] = mmul(mmul(f[vp], fi[vp - v], m), c.buf[b * c.L + vp], m);  // S[vp][v]
     }
 };
 // Power tables of g = C(v, d) and 1/g: x^e = hi[e >> h] lo[e & (LO-1)].
@@ -188,12 +200,14 @@ struct Stage2Pre {
             const Mod m = c.mod[b];
             const u64* fi = c.ifact + b * c.F1;
             const u64 gp = mmul(c.gihi[b * c.HI + (i >> c.h)], c.gilo[b * c.LO + (i & (c.LO - 1))], m);
-            r = mmul(mmul(mmul(c.S[b * c.TS + offS(v) + i - 1], gp, m), fi[i], m), fi[v - i], m);
+            const u64 x = i < (size_t)c.v0 ? c.S[b * c.TS + offS(v) + i - 1] : tile(c.SS, c, b, i)[v];
+            r = mmul(mmul(mmul(x, gp, m), fi[i], m), fi[v - i], m);
         }
         c.buf[b * c.L + i] = r;
     }
 };
-// Stage 2 output: V[p][v] = g^p [C(p-1, v) - p! / (p-v-1)! c[p]], v < p <= nmax.
+// Stage 2 output: V[p][v] = g^p [C(p-1, v) - p! / (p-v-1)! c[p]], v < p <= nmax. When L = nmax the
+// entry c[nmax] is read at index 0 (see transform_length).
 struct Stage2Post {
     Ctx c;
     int v;
@@ -202,10 +216,29 @@ struct Stage2Post {
         if (i >= (size_t)(c.nmax - v)) return;
         const Mod m = c.mod[b];
         const u64 *f = c.fact + b * c.F1, *fi = c.ifact + b * c.F1;
-        u64 t = msub(mmul(f[p - 1], fi[v], m), mmul(f[p], c.buf[b * c.L + p], m), m);
+        u64 t = msub(mmul(f[p - 1], fi[v], m), mmul(f[p], c.buf[b * c.L + (p & (c.L - 1))], m), m);
         t = mmul(t, fi[p - v - 1], m);
         const u64 gp = mmul(c.ghi[b * c.HI + (p >> c.h)], c.glo[b * c.LO + (p & (c.LO - 1))], m);
-        c.V[b * c.T + offV(p) + v] = mmul(t, gp, m);
+        tile(c.VS, c, b, v)[p] = mmul(t, gp, m);  // V[p][v]
+    }
+};
+// Moves the tile columns v0 .. vlast into the rows of S (S[r][q], 1 <= q <= r < nmax) and V
+// (V[r][w], w < r <= nmax) and clears the tile. One index per (prime, row).
+struct FlushTile {
+    Ctx c;
+    int vlast;
+    DEV void operator()(size_t idx) const {
+        const size_t b = idx / c.NS, r = idx % c.NS;
+        u64 *ss = c.SS + b * TILE * c.NS, *vs = c.VS + b * TILE * c.NS;
+        for (size_t t = 0; t < TILE; ++t) {
+            const size_t q = (size_t)c.v0 + t;
+            if (q <= (size_t)vlast) {
+                if (q <= r && r < (size_t)c.nmax) c.S[b * c.TS + offS(r) + q - 1] = ss[t * c.NS + r];
+                if (q < r && r <= (size_t)c.nmax) c.V[b * c.T + offV(r) + q] = vs[t * c.NS + r];
+            }
+            ss[t * c.NS + r] = 0;
+            vs[t * c.NS + r] = 0;
+        }
     }
 };
 struct Pointwise {
@@ -270,28 +303,22 @@ struct NttInv {
         for (int k = 0; k < n; ++k) a[k * s] = x[k];
     }
 };
-// Query (n, M): A[w] = (M-w-1)! / (w! (M-w)!), then for each q <= n
-//   out[q] = sum_{w<q} A[w] V[q][w] / (q-w-1)!   ( = sum_w C(M-w-1, M-q) C(M, w) V[q][w] (M-q)! / M! ).
-struct QueryA {
+// All queries in one pass over V. For a query (n, M) and a row q <= n the driver needs
+//   out[q] = sum_{w<q} C(M-w-1, M-q) C(M, w) V[q][w] (M-q)! / M!
+//          = sum_{w<q} U[w] / (M - w),   U[w] = V[q][w] / (w! (q-w-1)!),
+// since (M-w-1)! / (w! (M-w)!) = 1 / (w! (M-w)). U does not depend on the query, so each row of V
+// is read once for all of them. One index per (prime, row, query).
+struct QueryAll {
     Ctx c;
-    int n, M;
     DEV void operator()(size_t idx) const {
-        const size_t b = idx / n, w = idx % n;
+        const size_t j = idx % c.J, rest = idx / c.J, q = 1 + rest % c.NA, b = rest / c.NA;
+        if (q > c.qN[j]) return;
         const Mod m = c.mod[b];
-        const u64 *f = c.fact + b * c.F1, *fi = c.ifact + b * c.F1;
-        c.A[b * c.NA + w] = mmul(mmul(f[M - w - 1], fi[w], m), fi[M - w], m);
-    }
-};
-struct QueryInner {
-    Ctx c;
-    int n;
-    DEV void operator()(size_t idx) const {
-        const size_t b = idx / n, q = 1 + idx % n;
-        const Mod m = c.mod[b];
-        const u64 *fi = c.ifact + b * c.F1, *A = c.A + b * c.NA, *row = c.V + b * c.T + offV(q);
+        const u64 *fi = c.ifact + b * c.F1, *inv = c.inv + b * c.F1, *row = c.V + b * c.T + offV(q);
+        const size_t M = c.qM[j];
         u64 s = 0;
-        for (size_t w = 0; w < q; ++w) s = madd(s, mmul(mmul(A[w], fi[q - w - 1], m), row[w], m), m);
-        c.qout[b * c.NA + q - 1] = s;
+        for (size_t w = 0; w < q; ++w) s = madd(s, mmul(mmul(mmul(fi[w], fi[q - 1 - w], m), row[w], m), inv[M - w], m), m);
+        c.qo[(b * c.J + j) * c.NA + q - 1] = s;
     }
 };
 
@@ -435,6 +462,14 @@ static size_t next_pow2(size_t n) {
     while (L < n) L <<= 1;
     return L;
 }
+// Transform length for a table up to nmax. Both convolutions use the kernel 1/t for 1 <= t <= nmax-1
+// only. Stage 1 multiplies a[0..v-1] and reads c[v..nmax-1]; stage 2 multiplies b[1..v] and reads
+// c[v+1..nmax]. A product index s + t >= L wraps to s + t - L <= v + nmax - 1 - L, which is below v
+// for L >= nmax, so no entry that is read picks up a wrapped term. The one entry at or past L is
+// c[nmax] when L = nmax: it is read at index 0, where only s + t = L (the true c[nmax]) lands,
+// since s + t >= 1 in stage 1 and s + t >= 2 in stage 2. Hence L = next_pow2(nmax), which is half
+// of next_pow2(nmax + 1) when nmax is a power of two.
+static size_t transform_length(size_t nmax) { return std::max<size_t>(16, next_pow2(nmax)); }
 
 static void ntt_forward(const Ctx& c, size_t B) {
 #if USE_IFMA
@@ -470,6 +505,144 @@ static void ntt_inverse(const Ctx& c, size_t B) {
         ls += r;
         rem -= r;
     }
+}
+
+#ifdef __CUDACC__
+// ---- GPU convolution in three kernels ----
+// With L = 2^lg, the bottom lgB = min(lg, 11) levels act inside blocks of BI = 2^lgB consecutive
+// entries, and the top lg1 = lg - lgB levels act on groups {i0 + k BI : k < 2^lg1}. k_fwd_top runs
+// the top forward levels on tiles of 2048 entries (2^(11 - lg1) consecutive i0 times all k) in
+// shared memory; k_mid runs the bottom forward levels, the pointwise product and the bottom
+// inverse levels on one block in shared memory; k_inv_top runs the top inverse levels. The
+// butterflies and twiddles are those of NttFwd / Pointwise / NttInv, so the result is identical.
+#define CONV_LG 11
+__global__ void k_fwd_top(Ctx c, int lg1, int lgT0) {
+    extern __shared__ u64 sm[];
+    const size_t b = blockIdx.y, L = c.L, BI = L >> lg1, G = (size_t)1 << lg1, T0 = (size_t)1 << lgT0;
+    const size_t i0 = (size_t)blockIdx.x << lgT0, n = G << lgT0;
+    const Mod m = c.mod[b];
+    u64* a = c.buf + b * L;
+    const u64* tw = c.tw + b * L;
+    for (size_t e = threadIdx.x; e < n; e += blockDim.x) sm[e] = a[i0 + (e & (T0 - 1)) + (e >> lgT0) * BI];
+    __syncthreads();
+    for (int l = lg1 - 1; l >= 0; --l) {
+        const size_t hk = (size_t)1 << l, h = BI << l;
+        for (size_t t = threadIdx.x; t < n / 2; t += blockDim.x) {
+            const size_t i = t & (T0 - 1), kk = t >> lgT0, k = ((kk >> l) << (l + 1)) | (kk & (hk - 1));
+            const size_t e0 = (k << lgT0) | i, e1 = e0 + (hk << lgT0), x = i0 + i + k * BI;
+            const u64 u = sm[e0], w = sm[e1];
+            sm[e0] = madd(u, w, m);
+            sm[e1] = mmul(msub(u, w, m), tw[h + (x & (h - 1))], m);
+        }
+        __syncthreads();
+    }
+    for (size_t e = threadIdx.x; e < n; e += blockDim.x) a[i0 + (e & (T0 - 1)) + (e >> lgT0) * BI] = sm[e];
+}
+__global__ void k_inv_top(Ctx c, int lg1, int lgT0) {
+    extern __shared__ u64 sm[];
+    const size_t b = blockIdx.y, L = c.L, BI = L >> lg1, G = (size_t)1 << lg1, T0 = (size_t)1 << lgT0;
+    const size_t i0 = (size_t)blockIdx.x << lgT0, n = G << lgT0;
+    const Mod m = c.mod[b];
+    u64* a = c.buf + b * L;
+    const u64* tw = c.twinv + b * L;
+    for (size_t e = threadIdx.x; e < n; e += blockDim.x) sm[e] = a[i0 + (e & (T0 - 1)) + (e >> lgT0) * BI];
+    __syncthreads();
+    for (int l = 0; l < lg1; ++l) {
+        const size_t hk = (size_t)1 << l, h = BI << l;
+        for (size_t t = threadIdx.x; t < n / 2; t += blockDim.x) {
+            const size_t i = t & (T0 - 1), kk = t >> lgT0, k = ((kk >> l) << (l + 1)) | (kk & (hk - 1));
+            const size_t e0 = (k << lgT0) | i, e1 = e0 + (hk << lgT0), x = i0 + i + k * BI;
+            const u64 u = sm[e0], w = mmul(sm[e1], tw[h + (x & (h - 1))], m);
+            sm[e0] = madd(u, w, m);
+            sm[e1] = msub(u, w, m);
+        }
+        __syncthreads();
+    }
+    for (size_t e = threadIdx.x; e < n; e += blockDim.x) a[i0 + (e & (T0 - 1)) + (e >> lgT0) * BI] = sm[e];
+}
+__global__ void k_mid(Ctx c, int lgB) {
+    extern __shared__ u64 sm[];
+    const size_t b = blockIdx.y, L = c.L, BI = (size_t)1 << lgB, base = (size_t)blockIdx.x << lgB;
+    const Mod m = c.mod[b];
+    u64* a = c.buf + b * L + base;
+    const u64 *tw = c.tw + b * L, *ti = c.twinv + b * L, *hat = c.hat + b * L + base;
+    for (size_t e = threadIdx.x; e < BI; e += blockDim.x) sm[e] = a[e];
+    __syncthreads();
+    for (int lh = lgB - 1; lh >= 0; --lh) {
+        const size_t h = (size_t)1 << lh;
+        for (size_t t = threadIdx.x; t < BI / 2; t += blockDim.x) {
+            const size_t j = t & (h - 1), e0 = ((t >> lh) << (lh + 1)) | j, e1 = e0 + h;
+            const u64 u = sm[e0], w = sm[e1];
+            sm[e0] = madd(u, w, m);
+            sm[e1] = mmul(msub(u, w, m), tw[h + j], m);
+        }
+        __syncthreads();
+    }
+    for (size_t e = threadIdx.x; e < BI; e += blockDim.x) sm[e] = mmul(sm[e], hat[e], m);
+    __syncthreads();
+    for (int lh = 0; lh < lgB; ++lh) {
+        const size_t h = (size_t)1 << lh;
+        for (size_t t = threadIdx.x; t < BI / 2; t += blockDim.x) {
+            const size_t j = t & (h - 1), e0 = ((t >> lh) << (lh + 1)) | j, e1 = e0 + h;
+            const u64 u = sm[e0], w = mmul(sm[e1], ti[h + j], m);
+            sm[e0] = madd(u, w, m);
+            sm[e1] = msub(u, w, m);
+        }
+        __syncthreads();
+    }
+    for (size_t e = threadIdx.x; e < BI; e += blockDim.x) a[e] = sm[e];
+}
+// All queries for one row q of one prime per block: the block computes U[w] = V[q][w] / (w! (q-w-1)!)
+// in chunks of 2048 in shared memory, and the thread for query j accumulates U[w] / (M_j - w).
+// Same values as QueryAll, one multiplication per term instead of three.
+__global__ void k_query(Ctx c, int qmax) {
+    __shared__ u64 U[2048];
+    const size_t b = blockIdx.y, q = (size_t)blockIdx.x + 1;
+    if (q > (size_t)qmax) return;
+    const Mod m = c.mod[b];
+    const u64 *fi = c.ifact + b * c.F1, *inv = c.inv + b * c.F1, *row = c.V + b * c.T + offV(q);
+    for (size_t j0 = 0; j0 < c.J; j0 += blockDim.x) {
+        const size_t j = j0 + threadIdx.x;
+        const bool mine = j < c.J && q <= c.qN[j];
+        const size_t M = j < c.J ? c.qM[j] : 0;
+        u64 acc = 0;
+        for (size_t w0 = 0; w0 < q; w0 += 2048) {
+            const size_t cnt = q - w0 < 2048 ? q - w0 : 2048;
+            __syncthreads();
+            for (size_t e = threadIdx.x; e < cnt; e += blockDim.x) {
+                const size_t w = w0 + e;
+                U[e] = mmul(mmul(row[w], fi[w], m), fi[q - 1 - w], m);
+            }
+            __syncthreads();
+            if (mine)
+                for (size_t e = 0; e < cnt; ++e) acc = madd(acc, mmul(U[e], inv[M - w0 - e], m), m);
+        }
+        if (mine) c.qo[(b * c.J + j) * c.NA + q - 1] = acc;
+    }
+}
+static void gpu_convolve(const Ctx& c, size_t B) {
+    const int lgB = c.lg < CONV_LG ? c.lg : CONV_LG, lg1 = c.lg - lgB, lgT0 = CONV_LG - lg1;
+    const size_t BI = (size_t)1 << lgB, smem = 8 * ((size_t)1 << CONV_LG);
+    const unsigned thr = (unsigned)(BI / 2 < 1024 ? BI / 2 : 1024);
+    if (lg1 > 0) k_fwd_top<<<dim3((unsigned)(BI >> lgT0), (unsigned)B), 1024, smem>>>(c, lg1, lgT0);
+    k_mid<<<dim3((unsigned)(c.L >> lgB), (unsigned)B), thr, 8 * BI>>>(c, lgB);
+    if (lg1 > 0) k_inv_top<<<dim3((unsigned)(BI >> lgT0), (unsigned)B), 1024, smem>>>(c, lg1, lgT0);
+}
+#endif
+
+// Cyclic convolution of buf with the kernel spectrum hat (which carries the factor 1/L).
+static void convolve(const Ctx& c, size_t B) {
+#if USE_IFMA
+    ifma_convolve(c, B);
+    return;
+#endif
+#ifdef __CUDACC__
+    gpu_convolve(c, B);
+    return;
+#endif
+    ntt_forward(c, B);
+    launch(Pointwise{c}, B * c.L);
+    ntt_inverse(c, B);
 }
 
 struct Query {
@@ -559,13 +732,14 @@ int main(int argc, char** argv) {
     }
 
     // sizes for the largest table, then the batch size
-    const size_t Lmax = std::max<size_t>(16, next_pow2((size_t)nmax + 1));
+    const size_t Lmax = transform_length((size_t)nmax);
     const size_t F1 = (size_t)std::max(nmax, Mmax) + 1;
     const size_t Tmax = offV((size_t)nmax + 1), TSmax = offS((size_t)nmax);
     int h = 0;
     while ((1 << (2 * h)) < nmax + 1) ++h;  // LO ~ sqrt(nmax)
     const size_t LO = (size_t)1 << h, HI = ((size_t)nmax >> h) + 1, NA = (size_t)nmax;
-    const size_t per_prime = 8 * (2 * F1 + 4 * Lmax + Tmax + TSmax + 2 * (LO + HI) + 2 * NA) + sizeof(Mod);
+    const size_t NS = (size_t)nmax + 1;
+    const size_t per_prime = 8 * (3 * F1 + 4 * Lmax + Tmax + TSmax + 2 * (LO + HI) + qs.size() * NA + 2 * TILE * NS) + sizeof(Mod);
     if (batch <= 0) {
 #ifdef __CUDACC__
         batch = (long)((dev_free_bytes() - (dev_free_bytes() >> 4)) / per_prime);
@@ -596,12 +770,17 @@ int main(int argc, char** argv) {
     c.ghi = (u64*)dev_alloc(8 * B * HI);
     c.gilo = (u64*)dev_alloc(8 * B * LO);
     c.gihi = (u64*)dev_alloc(8 * B * HI);
-    c.A = (u64*)dev_alloc(8 * B * NA);
-    c.qout = (u64*)dev_alloc(8 * B * NA);
+    c.inv = (u64*)dev_alloc(8 * B * F1);
+    c.qM = (u64*)dev_alloc(8 * qs.size());
+    c.qN = (u64*)dev_alloc(8 * qs.size());
+    c.qo = (u64*)dev_alloc(8 * B * qs.size() * NA);
+    c.SS = (u64*)dev_alloc(8 * B * TILE * NS);
+    c.VS = (u64*)dev_alloc(8 * B * TILE * NS);
+    c.NS = NS, c.v0 = 1;
     c.F1 = F1, c.T = Tmax, c.TS = TSmax, c.LO = LO, c.HI = HI, c.NA = NA, c.h = h, c.d = d;
 
     std::vector<Mod> hmod(B);
-    std::vector<u64> hfact(B * F1), hifact(B * F1), htw, htwinv, hker, hq(B * NA);
+    std::vector<u64> hfact(B * F1), hifact(B * F1), hinv(B * F1), htw, htwinv, hker, hq(B * qs.size() * NA);
     const auto t0 = std::chrono::steady_clock::now();
     auto secs = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
 
@@ -611,7 +790,7 @@ int main(int argc, char** argv) {
         int nm = 0;
         for (const Query& q : qs)
             if (todo[at] < q.need) nm = std::max(nm, q.n);
-        const size_t L = std::max<size_t>(16, next_pow2((size_t)nm + 1));
+        const size_t L = transform_length((size_t)nm);
         c.L = L, c.nmax = nm, c.lg = 0;
         while (((size_t)1 << c.lg) < L) ++c.lg;
         htw.assign(B * L, 0), htwinv.assign(B * L, 0), hker.assign(B * L, 0);
@@ -646,11 +825,13 @@ int main(int argc, char** argv) {
                 t[0] = ti[0] = m.one;
                 for (size_t j = 1; j < half; ++j) t[j] = mmul(t[j - 1], wh, m), ti[j] = mmul(ti[j - 1], whi, m);
             }
-            for (int t = 1; t <= nm; ++t) hker[b * L + t] = mmul(fi[t], f[t - 1], m);  // 1/t
+            for (size_t t = 1; t < F1; ++t) hinv[b * F1 + t] = mmul(fi[t], f[t - 1], m);  // 1/t
+            for (int t = 1; t < nm; ++t) hker[b * L + t] = hinv[b * F1 + t];  // kernel 1/t, t <= nmax - 1
         }
         to_dev(c.mod, hmod.data(), B * sizeof(Mod));
         to_dev(c.fact, hfact.data(), 8 * B * F1);
         to_dev(c.ifact, hifact.data(), 8 * B * F1);
+        to_dev(c.inv, hinv.data(), 8 * B * F1);
         to_dev(c.tw, htw.data(), 8 * B * L);
         to_dev(c.twinv, htwinv.data(), 8 * B * L);
         to_dev(c.buf, hker.data(), 8 * B * L);
@@ -658,36 +839,48 @@ int main(int argc, char** argv) {
         launch(HatFinish{c}, B * L);
 
         for (int v = 1; v < nm; ++v) {
+            if ((v - 1) % TILE == 0) c.v0 = v;  // a new tile of columns starts at v
             if (v > d) {  // stage 1 (rows v <= d of V are zero, so S[.][v] stays zero)
                 launch(Stage1Pre{c, v}, B * L);
-                ntt_forward(c, B);
-                launch(Pointwise{c}, B * L);
-                ntt_inverse(c, B);
+                convolve(c, B);
                 launch(Stage1Post{c, v}, B * L);
             }
             if (v >= d) {  // stage 2 (g(v) = 0 below d: column v of V stays zero)
                 launch(PowTab{c, v}, B * 2 * (LO + HI));
                 launch(Stage2Pre{c, v}, B * L);
-                ntt_forward(c, B);
-                launch(Pointwise{c}, B * L);
-                ntt_inverse(c, B);
+                convolve(c, B);
                 launch(Stage2Post{c, v}, B * L);
             }
+            if (v - c.v0 == TILE - 1 || v == nm - 1) launch(FlushTile{c, v}, B * NS);
         }
         dev_sync();
         const double t_build = secs();
 
         std::vector<std::string> lines(nb);
-        for (const Query& q : qs) {
-            if (todo[at] >= q.need) continue;  // need is the same test for the whole batch only if
-            launch(QueryA{c, q.n, q.M}, B * (size_t)q.n);
-            launch(QueryInner{c, q.n}, B * (size_t)q.n);
-            from_dev(hq.data(), c.qout, 8 * B * NA);
+        std::vector<size_t> act;  // queries that the first prime of the batch still needs
+        std::vector<u64> hM, hN;
+        for (size_t j = 0; j < qs.size(); ++j)
+            if (todo[at] < qs[j].need) act.push_back(j), hM.push_back((u64)qs[j].M), hN.push_back((u64)qs[j].n);
+        c.J = act.size();
+        to_dev(c.qM, hM.data(), 8 * c.J);
+        to_dev(c.qN, hN.data(), 8 * c.J);
+        {
+            int qmax = 0;
+            for (u64 x : hN) qmax = std::max(qmax, (int)x);
+#ifdef __CUDACC__
+            k_query<<<dim3((unsigned)qmax, (unsigned)B), 128>>>(c, qmax);
+#else
+            launch(QueryAll{c}, B * NA * c.J);
+#endif
+        }
+        from_dev(hq.data(), c.qo, 8 * B * c.J * NA);
+        for (size_t jj = 0; jj < act.size(); ++jj) {
+            const Query& q = qs[act[jj]];
             for (size_t b = 0; b < nb; ++b) {
                 const long i = todo[at + b];
                 if (i >= q.need) continue;
                 const Mod m = hmod[b];
-                const u64 *f = &hfact[b * F1], *fi = &hifact[b * F1], *o = &hq[b * NA];
+                const u64 *f = &hfact[b * F1], *fi = &hifact[b * F1], *o = &hq[(b * c.J + jj) * NA];
                 const u64 Q = mmul(mmul(f[q.M], fi[d], m), fi[q.M - d], m);
                 u64 total = 0;  // Horner in Q: sum_q C(n,q) Q^(n-q) out[q] / (M-q)!
                 for (int k = 1; k <= q.n; ++k) {
